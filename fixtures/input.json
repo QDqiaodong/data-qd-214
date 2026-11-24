@@ -1,0 +1,2 @@
+{"sections":[{"id":"block-west","entry":"counter-w","exit":"counter-e"}],"events":[{"id":"scan-3","train_id":"freight-8","checkpoint":"counter-w","time":"2026-04-10T12:00:00+08:00","axles":64},{"id":"scan-4","train_id":"freight-8","checkpoint":"counter-e","time":"2026-04-10T12:06:30+08:00","axles":63},{"id":"scan-5","train_id":"service-2","checkpoint":"counter-w","time":"2026-04-10T12:08:00+08:00","axles":8}]}
+
