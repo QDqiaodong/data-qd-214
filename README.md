@@ -58,6 +58,35 @@ result = archive.apply_identities(plan["plan_id"], "apply-req")
 occupied 的入口”，而不是所有入口。多条最优解释会让出口保持 `ambiguous`、
 不可回填。详见 [docs/reconciliation-archive.md](docs/reconciliation-archive.md)。
 
+### 离线复位核销与更正防护
+
+分析员拿到已批准的历史复位记录后，可在一次提交里同时更正观测并登记/撤回复位：
+
+```python
+result = archive.revise_with_resets(
+    "reset-req", revision, upserts, deletes,
+    add_resets=[{
+        "id": "r1",
+        "section_id": "s1",
+        "time": "2026-04-11T00:00:00Z",
+        "authorization_ref": "AUTH-1",
+        "opening": [entry_event],   # 审批覆盖的完整未闭合入口，至少一条
+    }],
+    withdraw_reset_ids=[],
+)
+archive.read_reset("r1")           # 规范正文 + active；撤回不删历史
+archive.reviewed_day("s1", "2026-04-11")  # 复位感知的复核视图，不产生包或凭据
+```
+
+复位在同刻观测之前处理；只有当“当时未闭合入口全集”与 opening 五字段逐条
+完全一致时才核销这些入口，不产生 movement、不伪造观测，也不抹掉此前异常。
+`reviewed_day` 与原始日包并存：旧 `seal`/`current`/`take` 仍按原始观测语义
+工作。任何会推翻已登记复位所依据事实的观测更正或身份回填都会被整批拒绝，
+除非在同一批更正里明确撤回受影响的复位；纯复位变动不增加来源修订号，也不
+撤回原始包和取用凭据。
+
+完整语义、崩溃恢复故障注入点和测试说明见 [docs/reconciliation-archive.md](docs/reconciliation-archive.md)。
+
 完整语义、崩溃恢复故障注入点和测试说明见 [docs/reconciliation-archive.md](docs/reconciliation-archive.md)。
 
 ## 当前边界

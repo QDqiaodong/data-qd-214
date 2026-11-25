@@ -10,6 +10,12 @@ The persistent UTC-day handoff archive extends this baseline with immutable pack
 `plan_identities` reports the identity range supported by every globally
 optimal explanation, and `apply_identities` back-fills only forced associations
 as one ordinary source revision. Ambiguous associations are never back-filled,
-and axle-count differences remain visible evidence. Its detailed contract and
+and axle-count differences remain visible evidence. It also records approved
+offline reset write-offs through `revise_with_resets`, `read_reset` and the
+reset-aware `reviewed_day` view: a reset ends authorized unclosed entries for
+reconciliation without fabricating exits or movements, and any later
+observation correction or identity back-fill that would overturn a registered
+reset's unclosed evidence is rejected unless the affected reset is explicitly
+withdrawn in the same batch. Its detailed contract and
 recovery semantics are in [reconciliation-archive.md](reconciliation-archive.md). Like the baseline, it is offline data-version handoff only and is not signalling control or section-safety certification.
 

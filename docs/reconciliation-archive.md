@@ -377,3 +377,161 @@ Both are far inside the 60 s / 512 MiB budget. Re-run with
 `PYTHONPATH=src python3 -m unittest tests.test_identity_plans -v`; the
 `ResourceBoundTests` case prints the measured values and asserts the limits in
 an isolated `python -I` subprocess.
+
+## Offline reset write-offs and correction protection
+
+An analyst may receive an **approved historical reset record** for entries
+that can no longer be matched. The archive records that authorization as a
+*reset write-off* inside the review view. A write-off ends the named unclosed
+entries for reconciliation purposes only: it never fabricates an exit, never
+counts as a measured passing movement, and never rewrites the original
+handoff package or its observations. Like everything else in this archive it
+is post-hoc data handling — it issues no field permission, connects to no
+equipment, and makes no line-safety judgement.
+
+### Registering and reading resets
+
+```python
+result = archive.revise_with_resets(
+    request_id,
+    expected_revision,
+    upserts,            # ordinary observation corrections (same as revise)
+    deletes,
+    add_resets,         # new reset records
+    withdraw_reset_ids, # currently active reset ids to withdraw
+)
+# {"revision": int, "changed": bool,
+#  "added_reset_ids": [...sorted...], "withdrawn_reset_ids": [...sorted...]}
+
+archive.read_reset(reset_id)
+# {"record": <canonical body from first successful registration>,
+#  "active": bool}
+
+archive.reviewed_day(section_id, day)
+# {"section_id", "day", "opening", "movements", "anomalies",
+#  "closing", "resets"}
+```
+
+Each reset in `add_resets` contains exactly `id`, `section_id`, `time`,
+`authorization_ref` and `opening`:
+
+- `id`, `section_id` and `authorization_ref` are nonempty strings. The
+  authorization reference is recorded only; the archive never queries it
+  externally.
+- `time` is a timezone-aware instant normalized to UTC `Z` and must fall inside
+  the archive date range.
+- `opening` is the **complete** list of unclosed entries covered by the
+  authorization, at least one item. Each item is the same five-field body as a
+  raw observation, deduplicated by event id. Every entry must belong to the
+  reset's own section, must be an entry observation, and must be strictly
+  earlier than the reset (compared at UTC microsecond precision). The stored
+  opening is sorted by event id.
+- The opening evidence is supplied by the caller. The archive never fills in,
+  drops or rewrites authorization evidence based on its current data.
+
+Reset ids form their own namespace, separate from observation ids, and are
+**permanently unique** within an archive — a withdrawn id can never be
+registered again. Withdrawal only flips `active` to false; the canonical body
+stays readable through `read_reset` and history is never deleted or edited.
+
+Batch and active-set limits (judged on the final effective collection, so a
+same-batch withdrawal can free a slot or an instant for a replacement):
+
+- at most 1000 additions and at most 1000 withdrawals per request;
+- at most 1000 simultaneously active resets in the archive;
+- at most one active reset per section at a given UTC instant; different
+  sections do not interfere.
+
+### Reset-aware review replay
+
+From the first range day onward, each section's observations and currently
+active resets are replayed in UTC-time order. A reset at an instant is
+processed **before** the observations of that same instant. Ordinary
+observations keep the original pairing rules: a later entry for a train that
+is already open is a `duplicate_entry`, an exit closes its entry (even on an
+axle mismatch), and an exit with no entry is an anomaly.
+
+When a reset is reached, the complete set of currently unclosed entries must
+match its `opening` exactly, comparing all five fields with UTC-equivalent
+time comparison. One extra entry, one missing entry, a swapped entry for the
+same train, or a changed axle count on the same id all fail the original
+authorization. Only on an exact match are those entries removed from review
+occupancy: no movement is created, no observation is fabricated, and earlier
+anomalies are not erased. Real observations after the reset pair normally, and
+a later exit with no entry remains an anomaly.
+
+`reviewed_day` returns the current review result for one section and UTC day:
+
+- `opening` — full entry observations still open at midnight before any reset
+  or observation of that day; `closing` — those still open after the whole day.
+  Real entries are carried across days with no observations just like a sealed
+  package.
+- `movements` and `anomalies` keep the original package fields and ordering,
+  attributed to the day of the observation that produced them; movement
+  duration still starts at the real entry.
+- `resets` — the canonical active reset records effective that day, sorted by
+  `(time, id)`, as write-off evidence distinct from any movement.
+
+`reviewed_day` is a review view, not a handoff package: it creates no package,
+no take credential, and requires no sealed day package. The original
+`process`, `seal`/`current`/`read_package`, and `take`/`read_take` keep
+working on raw-observation semantics; a sealed package therefore still
+reports duplicate entries and raw closures that the reset-aware review has
+written off.
+
+### Reset evidence constrains source writes
+
+`revise_with_resets` validates the **whole post-batch** observation and reset
+collection. Withdrawn records do not participate in the final replay; new
+records do. Success or failure never depends on array order, and no
+intermediate implementation state is required to be valid. Every remaining
+active reset is replayed from the first range day, including days after the
+correction, so:
+
+- withdrawing only an earlier reset can still be rejected when it leaves a
+  later reset without its authorized basis;
+- correcting an observation's axles, time or identity is rejected if it
+  overturns the unclosed fact a registered reset relies on, unless the affected
+  reset is explicitly withdrawn in the same batch;
+- the archive reports at least one failing reset id rather than silently
+  rewriting evidence, auto-withdrawing a reset, or checking only whether the
+  directly upserted/deleted ids appear in openings.
+
+The legacy `revise` and `apply_identities` obey the same constraint but have
+no permission to add or withdraw resets. In particular, an identity back-fill
+that would close an entry a reset was authorized to write off is rejected
+before any label changes; it cannot be bypassed by changing candidate
+calculation, partially applying, or warning only at query time. A call that
+does not disturb a reset keeps its original behavior.
+
+An actual source-observation change still increments the source `revision`
+exactly once and withdraws the affected raw packages and take credentials from
+the relevant UTC day onward, exactly as before. A **reset-only** change
+neither increments the source revision nor withdraws any raw package or
+credential. `changed` reports only whether raw observations changed;
+`added_reset_ids` and `withdrawn_reset_ids` always report the reset changes.
+
+### Request identity, replay and persistence for resets
+
+`revise_with_resets` shares the existing `request_id` namespace. After
+structural validation, the archive first checks the historical successful
+request, then the current revision, current references, and reset
+eligibility. Reordering the event list, reset list, per-reset opening, or
+withdrawal list — or using an equivalent UTC offset spelling — does not change
+request identity; malformed structures such as duplicate ids cannot be hidden
+by normalization. A repeated successful request returns the first result
+verbatim; the same id with a different operation or parameters raises
+`ValueError`; failed requests do not occupy their id. Unknown references,
+wrong types, out-of-range values and evidence conflicts all raise
+`ValueError`, and a failed batch leaves observations, reset history, package
+state and success receipts untouched.
+
+Reset records share the same atomic single-snapshot commit as everything
+else, so after a process exit and reopen the raw data, reset records, package
+status and receipts are all either the complete before-state or the complete
+after-state; a request that was persisted but whose response was lost can be
+re-fetched by replaying the identical request. Archives created before this
+feature reopen in place with no rebuild and gain empty reset storage
+automatically. Re-run the reset suite with
+`PYTHONPATH=src python3 -m unittest tests.test_reset_reconciliation -v`,
+including the independent `python -I` crash-recovery cases.

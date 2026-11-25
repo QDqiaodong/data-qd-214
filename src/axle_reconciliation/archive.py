@@ -36,6 +36,11 @@ _DAY_RE = re.compile(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$")
 _MAX_ITEMS = 100_000
 _MAX_SECTIONS = 1_000
 _MAX_RANGE_DAYS = 366
+_MAX_RESET_BATCH = 1_000
+_MAX_ACTIVE_RESETS = 1_000
+_RESET_FIELDS = frozenset(
+    {"id", "section_id", "time", "authorization_ref", "opening"}
+)
 
 
 def _is_real_int(value: object) -> bool:
@@ -158,6 +163,84 @@ def _normalize_event(
     }
 
 
+def _normalize_reset(
+    raw: object,
+    checkpoint_owner: dict[str, str],
+    sections_by_id: dict[str, dict[str, str]],
+    start_day: date,
+    end_day: date,
+) -> dict[str, Any]:
+    """Validate and canonically spell one reset submission.
+
+    The opening evidence is supplied by the caller exactly as authorized.  The
+    archive never fills in, drops or rewrites any opening observation; it only
+    normalizes the accepted timestamp spelling to UTC.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("each reset must be an object")
+    if frozenset(raw.keys()) != _RESET_FIELDS:
+        raise ValueError(
+            "reset must contain exactly id, section_id, time, "
+            "authorization_ref and opening"
+        )
+
+    reset_id = raw.get("id")
+    section_id = raw.get("section_id")
+    authorization_ref = raw.get("authorization_ref")
+    if not _nonempty_str(reset_id):
+        raise ValueError("reset id must be a nonempty string")
+    if not _nonempty_str(section_id) or section_id not in sections_by_id:
+        raise ValueError("reset section_id must identify a configured section")
+    if not _nonempty_str(authorization_ref):
+        raise ValueError("authorization_ref must be a nonempty string")
+    assert isinstance(reset_id, str)
+    assert isinstance(section_id, str)
+    assert isinstance(authorization_ref, str)
+
+    moment = _parse_timestamp(raw.get("time"))
+    reset_day = moment.date()
+    if not start_day <= reset_day <= end_day:
+        raise ValueError("reset UTC time is outside the archive date range")
+
+    raw_opening = raw.get("opening")
+    if not isinstance(raw_opening, list) or not 1 <= len(raw_opening) <= _MAX_ITEMS:
+        raise ValueError("reset opening must be a nonempty list of events")
+
+    section = sections_by_id[section_id]
+    entry_checkpoint = section["entry"]
+    opening: list[dict[str, Any]] = []
+    opening_ids: set[str] = set()
+    for raw_entry in raw_opening:
+        entry = _normalize_event(
+            raw_entry, checkpoint_owner, start_day, end_day
+        )
+        if checkpoint_owner[entry["checkpoint"]] != section_id:
+            raise ValueError(
+                "every reset opening entry must belong to the reset section"
+            )
+        if entry["checkpoint"] != entry_checkpoint:
+            raise ValueError("reset opening entries must be entry observations")
+        if entry["id"] in opening_ids:
+            raise ValueError("reset opening event ids must be unique")
+        opening_ids.add(entry["id"])
+        # Entries must be strictly earlier than the reset, compared at UTC
+        # microsecond precision.
+        if timestamp_microseconds(entry["time"]) >= timestamp_microseconds(
+            _canonical_timestamp(moment)
+        ):
+            raise ValueError("every reset opening entry must strictly precede the reset")
+        opening.append(entry)
+
+    opening.sort(key=lambda event: event["id"])
+    return {
+        "id": reset_id,
+        "section_id": section_id,
+        "time": _canonical_timestamp(moment),
+        "authorization_ref": authorization_ref,
+        "opening": opening,
+    }
+
+
 def _identity_digest(payload: dict[str, Any]) -> str:
     canonical = json.dumps(
         payload,
@@ -251,6 +334,8 @@ class ReconciliationArchive:
             "receipt_seq": 0,
             "plans": {},
             "plan_seq": 0,
+            "resets": {},
+            "reset_active": {},
         }
 
     def _load_state(self) -> dict[str, Any]:
@@ -280,6 +365,10 @@ class ReconciliationArchive:
         # Archives written before identity plans existed re-open in place.
         state.setdefault("plans", {})
         state.setdefault("plan_seq", 0)
+        # Archives written before offline reset reconciliation existed re-open
+        # in place without rebuilding anything.
+        state.setdefault("resets", {})
+        state.setdefault("reset_active", {})
         return state
 
     @property
@@ -472,6 +561,16 @@ class ReconciliationArchive:
             self._commit(request_id)
             return copy.deepcopy(result)
 
+        # Reset evidence is a hard constraint on source writes.  The check runs
+        # on the full post-batch observation set before anything is mutated;
+        # revise itself has no permission to add or withdraw resets.
+        candidate_events = dict(events)
+        for eid in normalized_deletes:
+            del candidate_events[eid]
+        for event in normalized_upserts:
+            candidate_events[event["id"]] = dict(event)
+        self._guard_resets(candidate_events)
+
         new_revision = current_revision + 1
 
         for eid in normalized_deletes:
@@ -485,6 +584,251 @@ class ReconciliationArchive:
         self._state["revision"] = new_revision
         self._grouped = None
         result = {"revision": new_revision, "changed": True}
+        self._put_request(request_id, identity, result)
+        self._commit(request_id)
+        return copy.deepcopy(result)
+
+    def revise_with_resets(
+        self,
+        request_id: str,
+        expected_revision: object,
+        upserts: object,
+        deletes: object,
+        add_resets: object,
+        withdraw_reset_ids: object,
+    ) -> dict[str, Any]:
+        """Atomically apply observation corrections and reset-record changes.
+
+        Source observations and reset records are validated against the whole
+        post-batch state.  Reset-only changes never increment the source
+        revision and never withdraw original packages or take credentials.
+        """
+        if not _nonempty_str(request_id):
+            raise ValueError("request_id must be a nonempty string")
+        if not _is_real_int(expected_revision) or expected_revision < 0:
+            raise ValueError("expected_revision must be a nonnegative integer")
+        if not isinstance(upserts, list) or len(upserts) > _MAX_ITEMS:
+            raise ValueError("upserts must be a list of at most 100000 events")
+        if not isinstance(deletes, list) or len(deletes) > _MAX_ITEMS:
+            raise ValueError("deletes must be a list of at most 100000 event ids")
+        if not isinstance(add_resets, list) or not 0 <= len(add_resets) <= _MAX_RESET_BATCH:
+            raise ValueError(
+                "add_resets must be a list of at most 1000 reset records"
+            )
+        if (
+            not isinstance(withdraw_reset_ids, list)
+            or not 0 <= len(withdraw_reset_ids) <= _MAX_RESET_BATCH
+        ):
+            raise ValueError(
+                "withdraw_reset_ids must be a list of at most 1000 reset ids"
+            )
+
+        start_day = _parse_day(self._state["config"]["start_day"])
+        end_day = _parse_day(self._state["config"]["end_day"])
+
+        normalized_upserts: list[dict[str, Any]] = []
+        upsert_ids: set[str] = set()
+        for raw_event in upserts:
+            event = _normalize_event(
+                raw_event, self._checkpoint_owner, start_day, end_day
+            )
+            eid = event["id"]
+            if eid in upsert_ids:
+                raise ValueError("upsert event ids must be unique within a request")
+            upsert_ids.add(eid)
+            normalized_upserts.append(event)
+
+        normalized_deletes: list[str] = []
+        delete_ids: set[str] = set()
+        for raw_id in deletes:
+            if not _nonempty_str(raw_id):
+                raise ValueError("delete ids must be nonempty strings")
+            assert isinstance(raw_id, str)
+            if raw_id in delete_ids:
+                raise ValueError("delete ids must be unique within a request")
+            delete_ids.add(raw_id)
+            normalized_deletes.append(raw_id)
+
+        if upsert_ids.intersection(delete_ids):
+            raise ValueError("the same event id cannot be upserted and deleted")
+
+        normalized_resets: list[dict[str, Any]] = []
+        add_reset_ids: set[str] = set()
+        for raw_reset in add_resets:
+            reset = _normalize_reset(
+                raw_reset,
+                self._checkpoint_owner,
+                self._sections_by_id,
+                start_day,
+                end_day,
+            )
+            reset_id = reset["id"]
+            if reset_id in add_reset_ids:
+                raise ValueError("reset ids must be unique within a request")
+            add_reset_ids.add(reset_id)
+            normalized_resets.append(reset)
+
+        normalized_withdrawals: list[str] = []
+        withdrawal_ids: set[str] = set()
+        for raw_id in withdraw_reset_ids:
+            if not _nonempty_str(raw_id):
+                raise ValueError("withdraw reset ids must be nonempty strings")
+            assert isinstance(raw_id, str)
+            if raw_id in withdrawal_ids:
+                raise ValueError(
+                    "withdraw reset ids must be unique within a request"
+                )
+            withdrawal_ids.add(raw_id)
+            normalized_withdrawals.append(raw_id)
+
+        if add_reset_ids.intersection(withdrawal_ids):
+            raise ValueError(
+                "the same reset id cannot be added and withdrawn in one request"
+            )
+
+        identity = _identity_digest(
+            {
+                "op": "revise_with_resets",
+                "request_id": request_id,
+                "expected_revision": expected_revision,
+                # Sorted arrays make input order irrelevant to request identity;
+                # UTC-equivalent timestamp spelling is already normalized.
+                "upserts": sorted(normalized_upserts, key=lambda event: event["id"]),
+                "deletes": sorted(normalized_deletes),
+                "add_resets": sorted(
+                    normalized_resets, key=lambda record: record["id"]
+                ),
+                "withdraw_reset_ids": sorted(normalized_withdrawals),
+            }
+        )
+        replayed = self._replay_saved(request_id, identity)
+        if replayed is not None:
+            return replayed
+
+        current_revision = int(self._state["revision"])
+        if expected_revision != current_revision:
+            raise ValueError("revision conflict")
+
+        events: dict[str, dict[str, Any]] = self._state["events"]
+        reset_records: dict[str, dict[str, Any]] = self._state["resets"]
+        reset_active: dict[str, bool] = self._state["reset_active"]
+
+        # -- Current-reference checks --------------------------------------
+        missing = [eid for eid in normalized_deletes if eid not in events]
+        if missing:
+            raise ValueError("deletes must identify currently existing events")
+
+        for reset_id in normalized_withdrawals:
+            if reset_id not in reset_records:
+                raise ValueError("withdraw targets must be existing reset records")
+            if not reset_active.get(reset_id, False):
+                raise ValueError("withdraw targets must be currently active resets")
+
+        for reset in normalized_resets:
+            # Reset ids are permanently unique, including withdrawn records,
+            # and live in a namespace separate from observation ids.
+            if reset["id"] in reset_records:
+                raise ValueError("reset ids are permanently unique within an archive")
+
+        added_count = sum(
+            1 for event in normalized_upserts if event["id"] not in events
+        )
+        candidate_count = len(events) - len(normalized_deletes) + added_count
+        if candidate_count > _MAX_ITEMS:
+            raise ValueError("the revised event set may contain at most 100000 events")
+
+        # -- Final active reset set: limits and same-instant conflicts ------
+        # Judged on the final effective collection, so an old record withdrawn
+        # in this same batch may be replaced at the same instant by a new id.
+        final_active: dict[str, dict[str, Any]] = {
+            reset_id: copy.deepcopy(record)
+            for reset_id, record in reset_records.items()
+            if reset_active.get(reset_id, False)
+            and reset_id not in withdrawal_ids
+        }
+        for reset in normalized_resets:
+            final_active[reset["id"]] = copy.deepcopy(reset)
+
+        if len(final_active) > _MAX_ACTIVE_RESETS:
+            raise ValueError("an archive may hold at most 1000 active resets")
+
+        instant_owner: dict[tuple[str, int], str] = {}
+        for reset_id, record in final_active.items():
+            key = (
+                record["section_id"],
+                timestamp_microseconds(record["time"]),
+            )
+            owner = instant_owner.get(key)
+            if owner is not None:
+                raise ValueError(
+                    "a section may have at most one active reset at a given UTC instant"
+                )
+            instant_owner[key] = reset_id
+
+        # -- Post-batch observations ----------------------------------------
+        candidate_events = dict(events)
+        for eid in normalized_deletes:
+            del candidate_events[eid]
+        for event in normalized_upserts:
+            candidate_events[event["id"]] = dict(event)
+
+        affected: dict[str, str] = {}
+        changed = False
+
+        def mark(event: dict[str, Any]) -> None:
+            sid = self._checkpoint_owner[event["checkpoint"]]
+            day = event["time"][:10]
+            previous = affected.get(sid)
+            if previous is None or day < previous:
+                affected[sid] = day
+
+        for eid in normalized_deletes:
+            changed = True
+            mark(events[eid])
+        for new_event in normalized_upserts:
+            old_event = events.get(new_event["id"])
+            if old_event != new_event:
+                changed = True
+                if old_event is not None:
+                    mark(old_event)
+                mark(new_event)
+
+        # -- Whole-batch reset evidence replay ------------------------------
+        failures = self._reset_failures(
+            candidate_events, list(final_active.values())
+        )
+        if failures:
+            raise ValueError(
+                "reset evidence no longer matches the unclosed entries: "
+                + ", ".join(failures)
+            )
+
+        # -- Commit: source revision first, then reset history --------------
+        new_revision = current_revision
+        if changed:
+            new_revision = current_revision + 1
+            for eid in normalized_deletes:
+                del events[eid]
+            for event in normalized_upserts:
+                events[event["id"]] = dict(event)
+            for sid, earliest_day in affected.items():
+                self._invalidate_from(sid, earliest_day, new_revision)
+            self._state["revision"] = new_revision
+            self._grouped = None
+
+        for reset_id in normalized_withdrawals:
+            # Withdrawal only flips the active flag; the canonical body stays.
+            reset_active[reset_id] = False
+        for reset in normalized_resets:
+            reset_records[reset["id"]] = copy.deepcopy(reset)
+            reset_active[reset["id"]] = True
+
+        result = {
+            "revision": new_revision,
+            "changed": changed,
+            "added_reset_ids": sorted(add_reset_ids),
+            "withdrawn_reset_ids": sorted(withdrawal_ids),
+        }
         self._put_request(request_id, identity, result)
         self._commit(request_id)
         return copy.deepcopy(result)
@@ -535,6 +879,363 @@ class ReconciliationArchive:
         self._grouped = groups
         self._grouped_revision = revision
         return groups
+
+    # ------------------------------------------------------------------
+    # Offline reset reconciliation: replay, verification, reviewed days
+    # ------------------------------------------------------------------
+
+    def _active_reset_records(self) -> list[dict[str, Any]]:
+        active = self._state["reset_active"]
+        records = self._state["resets"]
+        return [
+            copy.deepcopy(records[reset_id])
+            for reset_id in active
+            if active.get(reset_id)
+        ]
+
+    @staticmethod
+    def _same_evidence(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        """Full five-field observation equality, UTC time spelling tolerant."""
+        if left.get("id") != right.get("id"):
+            return False
+        if left.get("train_id") != right.get("train_id"):
+            return False
+        if left.get("checkpoint") != right.get("checkpoint"):
+            return False
+        if left.get("axles") != right.get("axles"):
+            return False
+        try:
+            return timestamp_microseconds(left["time"]) == timestamp_microseconds(
+                right["time"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _reset_failures(
+        self,
+        candidate_events: dict[str, dict[str, Any]],
+        active_records: list[dict[str, Any]],
+    ) -> list[str]:
+        """Replay every section with active resets and return failing reset ids.
+
+        The check uses the whole candidate observation set (including days
+        after any correction), the final active reset set, and never depends on
+        the order of the submitted arrays.
+        """
+        if not active_records:
+            return []
+
+        section_ids = {record["section_id"] for record in active_records}
+        events_by_section: dict[str, list[dict[str, Any]]] = {}
+        for event in candidate_events.values():
+            sid = self._checkpoint_owner[event["checkpoint"]]
+            if sid in section_ids:
+                events_by_section.setdefault(sid, []).append(dict(event))
+
+        failures: list[str] = []
+        for section_id in section_ids:
+            section = self._sections_by_id[section_id]
+            events = sorted(
+                events_by_section.get(section_id, []),
+                key=lambda event: (
+                    timestamp_microseconds(event["time"]),
+                    event["id"],
+                ),
+            )
+            resets = sorted(
+                (
+                    record
+                    for record in active_records
+                    if record["section_id"] == section_id
+                ),
+                key=lambda record: (
+                    timestamp_microseconds(record["time"]),
+                    record["id"],
+                ),
+            )
+
+            # One ordered stream; at the same UTC instant a reset precedes the
+            # observations of that instant.
+            timeline: list[tuple[int, int, str, Any]] = []
+            for event in events:
+                timeline.append(
+                    (timestamp_microseconds(event["time"]), 1, event["id"], event)
+                )
+            for record in resets:
+                timeline.append(
+                    (timestamp_microseconds(record["time"]), 0, record["id"], record)
+                )
+            timeline.sort(key=lambda item: (item[0], item[1], item[2]))  # reset kind 0 before event kind 1
+
+            active: dict[str, dict[str, Any]] = {}
+            for _, kind, _, payload in timeline:
+                if kind == 0:
+                    record = payload
+                    opening = record["opening"]
+                    current = sorted(
+                        active.values(),
+                        key=lambda event: event["id"],
+                    )
+                    authorized = sorted(
+                        (dict(entry) for entry in opening),
+                        key=lambda event: event["id"],
+                    )
+                    matches = len(current) == len(authorized) and all(
+                        self._same_evidence(current_entry, authorized_entry)
+                        for current_entry, authorized_entry in zip(
+                            current, authorized
+                        )
+                    )
+                    if not matches:
+                        failures.append(record["id"])
+                        continue
+                    # The opening is the complete current unclosed set, so a
+                    # valid write-off releases every occupied entry.  It
+                    # creates no movement and fabricates no observation.
+                    active = {}
+                    continue
+
+                event = payload
+                train_id = event["train_id"]
+                checkpoint = event["checkpoint"]
+                if checkpoint == section["entry"]:
+                    if train_id not in active:
+                        active[train_id] = dict(event)
+                    # A later entry while the train is open is a duplicate and
+                    # never replaces the still-open original entry.
+                elif checkpoint == section["exit"]:
+                    active.pop(train_id, None)
+
+        return sorted(set(failures))
+
+    def _guard_resets(
+        self, candidate_events: dict[str, dict[str, Any]]
+    ) -> None:
+        """Reject a write whose final state breaks any still-active reset."""
+        active_records = self._active_reset_records()
+        failures = self._reset_failures(candidate_events, active_records)
+        if failures:
+            raise ValueError(
+                "correction would invalidate registered reset(s): "
+                + ", ".join(failures)
+            )
+
+    def _reviewed_replay(
+        self,
+        section_id: str,
+        day_text: str,
+        events: list[dict[str, Any]],
+        resets: list[dict[str, Any]],
+        opening: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Run one UTC day of reset-aware review from a supplied opening set."""
+        section = self._sections_by_id[section_id]
+        entry_checkpoint = section["entry"]
+        exit_checkpoint = section["exit"]
+
+        timeline: list[tuple[int, int, str, Any]] = []
+        for event in events:
+            timeline.append(
+                (timestamp_microseconds(event["time"]), 1, event["id"], event)
+            )
+        for record in resets:
+            timeline.append(
+                (timestamp_microseconds(record["time"]), 0, record["id"], record)
+            )
+        timeline.sort(key=lambda item: (item[0], item[1], item[2]))  # reset kind 0 before event kind 1
+
+        active: dict[str, dict[str, Any]] = {
+            event["train_id"]: dict(event) for event in opening
+        }
+        movements: list[dict[str, Any]] = []
+        anomalies: list[dict[str, Any]] = []
+        day_resets: list[dict[str, Any]] = []
+
+        for _, kind, _, payload in timeline:
+            if kind == 0:
+                record = payload
+                day_resets.append(copy.deepcopy(record))
+                current = sorted(active.values(), key=lambda event: event["id"])
+                authorized = sorted(
+                    (dict(entry) for entry in record["opening"]),
+                    key=lambda event: event["id"],
+                )
+                matches = len(current) == len(authorized) and all(
+                    self._same_evidence(current_entry, authorized_entry)
+                    for current_entry, authorized_entry in zip(
+                        current, authorized
+                    )
+                )
+                if not matches:
+                    raise ValueError(
+                        f"reset {record['id']} no longer matches its authorized "
+                        "opening under current observations"
+                    )
+                # The opening is the complete current unclosed set; a valid
+                # write-off releases every occupied entry without a movement.
+                active = {}
+                continue
+
+            event = payload
+            train_id = event["train_id"]
+            checkpoint = event["checkpoint"]
+            if checkpoint == entry_checkpoint:
+                if train_id in active:
+                    anomalies.append(
+                        {
+                            "event_id": event["id"],
+                            "section_id": section_id,
+                            "train_id": train_id,
+                            "type": "duplicate_entry",
+                        }
+                    )
+                else:
+                    active[train_id] = dict(event)
+            elif checkpoint == exit_checkpoint:
+                opened = active.pop(train_id, None)
+                if opened is None:
+                    anomalies.append(
+                        {
+                            "event_id": event["id"],
+                            "section_id": section_id,
+                            "train_id": train_id,
+                            "type": "exit_without_entry",
+                        }
+                    )
+                else:
+                    entry_time = _parse_timestamp(opened["time"])
+                    exit_time = _parse_timestamp(event["time"])
+                    movements.append(
+                        {
+                            "section_id": section_id,
+                            "train_id": train_id,
+                            "entry_event_id": opened["id"],
+                            "exit_event_id": event["id"],
+                            "entry_axles": opened["axles"],
+                            "exit_axles": event["axles"],
+                            "duration_seconds": int(
+                                (exit_time - entry_time).total_seconds()
+                            ),
+                            "status": (
+                                "balanced"
+                                if opened["axles"] == event["axles"]
+                                else "axle_mismatch"
+                            ),
+                        }
+                    )
+            else:
+                raise ValueError(
+                    "checkpoint is not an entry or exit for its section"
+                )
+
+        movements.sort(key=lambda item: (item["section_id"], item["entry_event_id"]))
+        anomalies.sort(key=lambda item: item["event_id"])
+        closing = sorted(
+            (dict(event) for event in active.values()),
+            key=lambda event: (event["train_id"], event["id"]),
+        )
+        day_resets.sort(
+            key=lambda record: (
+                timestamp_microseconds(record["time"]),
+                record["id"],
+            )
+        )
+        return {
+            "movements": movements,
+            "anomalies": anomalies,
+            "closing": closing,
+            "resets": day_resets,
+        }
+
+    def reviewed_day(self, section_id: object, day: object) -> dict[str, Any]:
+        """Current reset-aware review result for one section and UTC day.
+
+        This is a review view, not a handoff package: it creates no package, no
+        take credential and requires no sealed day package.
+        """
+        if not _nonempty_str(section_id) or section_id not in self._sections_by_id:
+            raise ValueError("unknown section")
+        assert isinstance(section_id, str)
+        parsed_day = _parse_day(day)
+        config = self._state["config"]
+        start_day = _parse_day(config["start_day"])
+        end_day = _parse_day(config["end_day"])
+        if not start_day <= parsed_day <= end_day:
+            raise ValueError("day is outside the archive date range")
+        day_text = parsed_day.isoformat()
+
+        section_events = sorted(
+            (
+                dict(event)
+                for event in self._state["events"].values()
+                if self._checkpoint_owner[event["checkpoint"]] == section_id
+            ),
+            key=lambda event: (
+                timestamp_microseconds(event["time"]),
+                event["id"],
+            ),
+        )
+        active_records = [
+            record
+            for record in self._active_reset_records()
+            if record["section_id"] == section_id
+        ]
+
+        # Replay every day from the first range day so the opening set carries
+        # real entries across empty days, including through reset write-offs.
+        opening: list[dict[str, Any]] = []
+        movements: list[dict[str, Any]] = []
+        anomalies: list[dict[str, Any]] = []
+        day_resets: list[dict[str, Any]] = []
+        closing: list[dict[str, Any]] = []
+        midnight_opening: list[dict[str, Any]] = []
+        for ordinal in range(start_day.toordinal(), parsed_day.toordinal() + 1):
+            current_day = date.fromordinal(ordinal).isoformat()
+            if current_day == day_text:
+                midnight_opening = copy.deepcopy(opening)
+            day_events = [
+                event
+                for event in section_events
+                if event["time"][:10] == current_day
+            ]
+            day_reset_records = [
+                record
+                for record in active_records
+                if record["time"][:10] == current_day
+            ]
+            result = self._reviewed_replay(
+                section_id,
+                current_day,
+                day_events,
+                day_reset_records,
+                opening,
+            )
+            if current_day == day_text:
+                movements = result["movements"]
+                anomalies = result["anomalies"]
+                day_resets = result["resets"]
+            opening = result["closing"]
+            closing = result["closing"]
+
+        return {
+            "section_id": section_id,
+            "day": day_text,
+            "opening": midnight_opening,
+            "movements": movements,
+            "anomalies": anomalies,
+            "closing": closing,
+            "resets": day_resets,
+        }
+
+    def read_reset(self, reset_id: object) -> dict[str, Any]:
+        """Return the canonical reset body and its current active flag."""
+        if not _nonempty_str(reset_id) or reset_id not in self._state["resets"]:
+            raise ValueError("unknown reset")
+        assert isinstance(reset_id, str)
+        return {
+            "record": copy.deepcopy(self._state["resets"][reset_id]),
+            "active": bool(self._state["reset_active"].get(reset_id, False)),
+        }
 
     def seal(self, section_id: str, day: object, request_id: str) -> dict[str, Any]:
         if not _nonempty_str(request_id):
@@ -1053,6 +1754,18 @@ class ReconciliationArchive:
                 raise ValueError(
                     "back-fill would destroy an existing normal movement"
                 )
+
+        # -- 3b. A reset write-off is a hard constraint on source writes. ----
+        # Back-filling a label may close an entry that a registered reset was
+        # authorized to write off, so the whole post-apply observation set is
+        # replayed before any label is changed.  apply_identities has no
+        # permission to add or withdraw resets itself.
+        candidate_events = dict(self._state["events"])
+        for exit_id, new_train in new_train_by_exit.items():
+            candidate_events[exit_id] = dict(
+                candidate_events[exit_id], train_id=new_train
+            )
+        self._guard_resets(candidate_events)
 
         # -- 4. Commit one ordinary source revision with all corrections. ---
         events = self._state["events"]
