@@ -1,0 +1,24 @@
+{
+  "sections": [
+    {"id": "block-west", "entry": "counter-w", "exit": "counter-e"}
+  ],
+  "batches": [
+    {
+      "id": "collector-a-20260410-01",
+      "received_at": "2026-04-10T12:03:00+08:00",
+      "events": [
+        {"id": "scan-3", "train_id": "freight-8", "checkpoint": "counter-w", "time": "2026-04-10T12:00:00+08:00", "axles": 64},
+        {"id": "scan-4", "train_id": "freight-8", "checkpoint": "counter-e", "time": "2026-04-10T12:06:30+08:00", "axles": 63},
+        {"id": "scan-5", "train_id": "service-2", "checkpoint": "counter-w", "time": "2026-04-10T12:08:00+08:00", "axles": 8}
+      ]
+    },
+    {
+      "id": "collector-b-20260410-01",
+      "received_at": "2026-04-10T12:15:00+08:00",
+      "events": [
+        {"id": "scan-3", "train_id": "freight-8", "checkpoint": "counter-w", "time": "2026-04-10T04:00:00Z", "axles": 64},
+        {"id": "scan-5", "train_id": "service-2", "checkpoint": "counter-w", "time": "2026-04-10T12:08:00+08:00", "axles": 9}
+      ]
+    }
+  ]
+}
