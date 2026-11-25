@@ -216,3 +216,164 @@ reopen the path from the parent test process, and assert the public API state.
 
 Disk-media failure, whole-machine power loss and concurrent writers are outside
 the supported boundary.
+
+## Exit identity disambiguation and controlled back-fill
+
+The archive can also repair *local* exit train labels. Analysts explicitly
+name the exit observations to re-identify; the archive never guesses which
+exits are local. This remains offline data processing: it does not connect to
+or control signalling equipment.
+
+```python
+plan = archive.plan_identities(
+    "s1",                 # section_id
+    ["x", "y"],           # unidentified_exit_ids, 1..32, unique
+    0, 60, 20, 1,         # min_seconds, max_seconds, target_seconds, max_axle_gap
+    "plan-req",           # request_id
+)
+archive.read_identity_plan(plan["plan_id"])
+archive.apply_identities(plan["plan_id"], "apply-req")
+```
+
+### Why candidates come from the real occupied set
+
+Candidate entries are not "all entries in the section". The archive first
+removes the designated exits from the section's current observations and
+applies the **existing real pairing semantics** (`process`'s duplicate-entry,
+exit-without-entry and occupancy rules) to what remains. Only entries still
+`occupied` after that are candidates. Consequently:
+
+- an entry already closed by some other exit is unavailable;
+- a repeated entry keeps its **first** still-open observation, not a later
+  duplicate;
+- computing this never writes to the archive and does not need a sealed day
+  package;
+- if nothing remains after exclusion, the internal candidate set is simply
+  empty. Only the new planning API sees that empty set; the public
+  `process(data)` contract still rejects an empty `events` array.
+
+The empty exclusion result still yields a valid plan (all exits `unmatched`,
+no `forced_pairs`), but such a plan cannot be applied.
+
+### Explanations and uncertainty
+
+A candidate pair exists only when the entry is strictly earlier by
+`(UTC instant, event id)`, the **exact integer microsecond** interval is within
+`[min_seconds, max_seconds]`, and the absolute axle difference is at most
+`max_axle_gap`. The legacy rounding `duration_seconds` is not used for
+comparison or cost.
+
+An explanation is a one-to-one set of candidate pairs. Explanations are
+ordered by strict lexicographic priority: first the largest matched count, then
+the smallest sum of axle differences, then the smallest sum of
+`abs(interval_us - target_seconds * 1_000_000)`. There is no weighted sum
+approximation and no event-id or input-order tie-break. For each exit, the plan
+reports every entry that appears in **at least one** globally optimal
+explanation and whether **some** optimal explanation leaves it unmatched. A
+plan does not nominate a representative optimum:
+
+- `forced`: exactly one possible entry, and no optimal explanation leaves the
+  exit unmatched;
+- `unmatched`: no possible entry;
+- `ambiguous`: everything else, including "one possible entry but it may be
+  left unmatched" and "two entries that are each possible in different optima".
+
+`forced_pairs` contains only `forced` decisions, with the entry's original
+`train_id`. Presence of a candidate edge never implies presence in an optimum.
+
+The solver is a bounded min-cost max-flow with `_COST_SCALE = 10**20`; 32
+pairs times the maximum duration error stay far below the scale, so the
+three-level priority is exact rather than weighted. The possible-entry and
+may-be-unmatched sets are derived from the residual graph of that flow (all
+zero-reduced-cost cycles), so they cover all optima without enumerating them
+and without any explanation-count cap.
+
+### Applying is a controlled correction under current evidence
+
+`apply_identities` only back-fills the plan's own `forced_pairs`. It never
+widens to `ambiguous` exits, never adopts later-forced associations, and
+raises `ValueError` when the plan has no forced pairs. A successful apply does
+**not** merely compare `source_revision`; it re-checks:
+
+1. recompute the candidate set and optimal identity range from the **current**
+   section observations with the plan's own parameters; every original forced
+   pair must still be the same `forced` association;
+2. the full five-field observation of every forced entry and exit must still
+   match the plan evidence exactly (UTC-equivalent time spelling allowed).
+   Disappearance, section move, or changed axles/time/train rejects even if the
+   same association would still be forced;
+3. stage the label changes on a copy of the section's current events and run
+   the **old real pairing** over the whole section. Every forced pair must
+   produce exactly that `(entry_event_id, exit_event_id)` movement, and every
+   normal movement already present before the change must keep its entry and
+   exit identities. A still-`unmatched` (or `ambiguous`) designated exit whose
+   old local label would close a forced entry therefore blocks the apply.
+
+All three checks run before any commit. Rejections leave events, revision,
+packages, take credentials, plans and success receipts unchanged, and the
+failed `request_id` remains free. Later competition can make a plan
+unexecutable while leaving it readable; removing that competition restores
+executability without the plan being permanently voided. An unrelated
+correction in another section, or an unrelated closed movement in the same
+section, does not block an otherwise valid plan.
+
+On success, only the train labels of the forced exits change; `id`,
+`checkpoint`, `time` and `axles` are preserved. All corrections enter as one
+ordinary source revision (one revision if anything changed, none if every
+label is already the target) and use the existing withdrawal rules: the
+corrected day and later days for that section, plus their takes, are
+withdrawn; earlier days and other sections stay valid. Historical package
+bodies are immutable. Resealing the day produces the promised movements with
+the real entry duration; unequal axles stay `axle_mismatch` and are not
+"fixed".
+
+The result is
+
+```json
+{
+  "plan_id": "plan-1",
+  "revision": 2,
+  "changed": true,
+  "applied_pairs": [
+    {"entry_event_id": "b", "exit_event_id": "x", "train_id": "B",
+     "old_train_id": "local-x", "new_train_id": "B"}
+  ]
+}
+```
+
+with `applied_pairs` sorted by `exit_event_id` and covering every original
+forced pair.
+
+### Plans, replay and persistence
+
+`plan_identities` saves and returns an immutable plan whose body includes
+`plan_id`, `section_id`, `source_revision`, the full `unidentified_exit_ids`,
+the four rule parameters, `entry_candidates`, `exits`, `optimum`, `decisions`
+and `forced_pairs`. `read_identity_plan` returns that original body; later
+archive changes never rewrite it. Planning and reading do not change the event
+revision or withdraw packages/takes.
+
+`plan_identities` and `apply_identities` join the existing successful-request
+namespace (shared with `revise`, `seal` and `take`). Their request identity is
+the operation name plus all public parameters; the exit array order is
+irrelevant. A retried successful request returns the first result verbatim,
+even when the current evidence would no longer license an apply — that replay
+takes precedence over current-evidence checks. A *new* request id for the same
+plan is judged under current evidence. Failed requests do not occupy their id.
+
+The plan body and its success receipt, and the apply corrections and their
+receipt, are in the same atomic snapshot, so a crash leaves the full before-
+or after-state and reopen replay never applies twice. Archives created before
+this feature reopen in place; no packages, takes or request records are lost.
+
+Resource bound (measured, Python 3.11.2, Linux aarch64, 10 vCPU):
+
+| workload | wall clock | peak RSS |
+| --- | ---: | ---: |
+| one `plan_identities`, 32 candidates × 32 exits, all-zero cost | 0.012 s | 16 MiB |
+| one `plan_identities`, 32 candidates × 32 exits, random costs | 0.011 s | 16 MiB |
+
+Both are far inside the 60 s / 512 MiB budget. Re-run with
+`PYTHONPATH=src python3 -m unittest tests.test_identity_plans -v`; the
+`ResourceBoundTests` case prints the measured values and asserts the limits in
+an isolated `python -I` subprocess.

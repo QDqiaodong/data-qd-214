@@ -23,6 +23,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .identity import build_identity_evidence, pair_events, timestamp_microseconds
+
 __all__ = ["ReconciliationArchive"]
 
 _ARCHIVE_FILE_NAME = "reconciliation-archive.json"
@@ -247,6 +249,8 @@ class ReconciliationArchive:
             "requests": {},
             "package_seq": 0,
             "receipt_seq": 0,
+            "plans": {},
+            "plan_seq": 0,
         }
 
     def _load_state(self) -> dict[str, Any]:
@@ -273,6 +277,9 @@ class ReconciliationArchive:
         }
         if not required.issubset(state.keys()):
             raise ValueError("archive is corrupt")
+        # Archives written before identity plans existed re-open in place.
+        state.setdefault("plans", {})
+        state.setdefault("plan_seq", 0)
         return state
 
     @property
@@ -750,3 +757,347 @@ class ReconciliationArchive:
             "valid": invalidated_by_revision is None,
             "invalidated_by_revision": invalidated_by_revision,
         }
+
+    # ------------------------------------------------------------------
+    # Identity plans
+    # ------------------------------------------------------------------
+
+    def _section_events(self, section_id: str) -> list[dict[str, Any]]:
+        """Return detached copies of every current observation of a section."""
+        return [
+            dict(event)
+            for event in self._state["events"].values()
+            if self._checkpoint_owner[event["checkpoint"]] == section_id
+        ]
+
+    @staticmethod
+    def _normalize_identity_rules(
+        min_seconds: object,
+        max_seconds: object,
+        target_seconds: object,
+        max_axle_gap: object,
+    ) -> dict[str, int]:
+        values = (min_seconds, max_seconds, target_seconds, max_axle_gap)
+        if not all(_is_real_int(value) for value in values):
+            raise ValueError("identity rule parameters must be integers")
+        assert _is_real_int(min_seconds)
+        assert _is_real_int(max_seconds)
+        assert _is_real_int(target_seconds)
+        assert _is_real_int(max_axle_gap)
+        if not 0 <= min_seconds <= target_seconds <= max_seconds <= 604800:
+            raise ValueError(
+                "identity seconds must satisfy 0 <= min <= target <= max <= 604800"
+            )
+        if not 0 <= max_axle_gap <= 999:
+            raise ValueError("max_axle_gap must be an integer in 0..999")
+        return {
+            "min_seconds": min_seconds,
+            "max_seconds": max_seconds,
+            "target_seconds": target_seconds,
+            "max_axle_gap": max_axle_gap,
+        }
+
+    @staticmethod
+    def _normalize_exit_ids(exit_ids: object) -> list[str]:
+        if not isinstance(exit_ids, list) or not 1 <= len(exit_ids) <= 32:
+            raise ValueError(
+                "unidentified_exit_ids must be a list of 1..32 event ids"
+            )
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for exit_id in exit_ids:
+            if not _nonempty_str(exit_id):
+                raise ValueError("exit event ids must be nonempty strings")
+            assert isinstance(exit_id, str)
+            if exit_id in seen:
+                raise ValueError("exit event ids must be unique")
+            seen.add(exit_id)
+            normalized.append(exit_id)
+        return normalized
+
+    def _identity_evidence(
+        self,
+        section_id: str,
+        exit_ids: list[str],
+        rules: dict[str, int],
+        section_events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        section = self._sections_by_id[section_id]
+        events = (
+            self._section_events(section_id)
+            if section_events is None
+            else section_events
+        )
+        by_id = {event["id"]: event for event in events}
+        exits: list[dict[str, Any]] = []
+        for exit_id in sorted(exit_ids):
+            event = by_id.get(exit_id)
+            if event is None:
+                raise ValueError(
+                    "unidentified exit is not a current observation of the section"
+                )
+            if event["checkpoint"] != section["exit"]:
+                raise ValueError(
+                    "unidentified exit is not an exit observation of the section"
+                )
+            exits.append(dict(event))
+        return build_identity_evidence(
+            events,
+            section["entry"],
+            section["exit"],
+            exits,
+            min_seconds=rules["min_seconds"],
+            max_seconds=rules["max_seconds"],
+            target_seconds=rules["target_seconds"],
+            max_axle_gap=rules["max_axle_gap"],
+        )
+
+    def plan_identities(
+        self,
+        section_id: object,
+        unidentified_exit_ids: object,
+        min_seconds: object,
+        max_seconds: object,
+        target_seconds: object,
+        max_axle_gap: object,
+        request_id: object,
+    ) -> dict[str, Any]:
+        """Create and persist an immutable identity-disambiguation plan."""
+        if not _nonempty_str(request_id):
+            raise ValueError("request_id must be a nonempty string")
+        if not _nonempty_str(section_id) or section_id not in self._sections_by_id:
+            raise ValueError("unknown section")
+        assert isinstance(section_id, str)
+        exit_ids = self._normalize_exit_ids(unidentified_exit_ids)
+        rules = self._normalize_identity_rules(
+            min_seconds, max_seconds, target_seconds, max_axle_gap
+        )
+
+        identity = _identity_digest(
+            {
+                "op": "plan_identities",
+                "request_id": request_id,
+                "section_id": section_id,
+                # Exit array order does not affect request identity.
+                "unidentified_exit_ids": sorted(exit_ids),
+                "rules": rules,
+            }
+        )
+        replayed = self._replay_saved(request_id, identity)
+        if replayed is not None:
+            return replayed
+
+        evidence = self._identity_evidence(section_id, exit_ids, rules)
+
+        self._state["plan_seq"] = int(self._state["plan_seq"]) + 1
+        plan_id = f"plan-{self._state['plan_seq']}"
+        body: dict[str, Any] = {
+            "plan_id": plan_id,
+            "section_id": section_id,
+            "source_revision": int(self._state["revision"]),
+            "unidentified_exit_ids": list(exit_ids),
+        }
+        body.update(rules)
+        body.update(evidence)
+        self._state["plans"][plan_id] = copy.deepcopy(body)
+        result = copy.deepcopy(body)
+        self._put_request(request_id, identity, result)
+        self._commit(request_id)
+        return result
+
+    def read_identity_plan(self, plan_id: object) -> dict[str, Any]:
+        if not _nonempty_str(plan_id) or plan_id not in self._state["plans"]:
+            raise ValueError("unknown identity plan")
+        assert isinstance(plan_id, str)
+        return copy.deepcopy(self._state["plans"][plan_id])
+
+    @staticmethod
+    def _same_observation(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        if left.get("id") != right.get("id"):
+            return False
+        if left.get("train_id") != right.get("train_id"):
+            return False
+        if left.get("checkpoint") != right.get("checkpoint"):
+            return False
+        if left.get("axles") != right.get("axles"):
+            return False
+        try:
+            return timestamp_microseconds(left["time"]) == timestamp_microseconds(
+                right["time"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def apply_identities(
+        self, plan_id: object, request_id: object
+    ) -> dict[str, Any]:
+        """Back-fill only the forced pairs of a saved plan, if still licensed."""
+        if not _nonempty_str(request_id):
+            raise ValueError("request_id must be a nonempty string")
+        if not _nonempty_str(plan_id) or plan_id not in self._state["plans"]:
+            raise ValueError("unknown identity plan")
+        assert isinstance(plan_id, str)
+
+        identity = _identity_digest(
+            {
+                "op": "apply_identities",
+                "request_id": request_id,
+                "plan_id": plan_id,
+            }
+        )
+        replayed = self._replay_saved(request_id, identity)
+        if replayed is not None:
+            return replayed
+
+        plan = self._state["plans"][plan_id]
+        forced_pairs: list[dict[str, Any]] = plan["forced_pairs"]
+        if not forced_pairs:
+            raise ValueError("identity plan has no forced pairs to apply")
+
+        section_id = plan["section_id"]
+        if section_id not in self._sections_by_id:
+            raise ValueError("unknown plan section")
+        section = self._sections_by_id[section_id]
+        rules = {
+            key: plan[key]
+            for key in (
+                "min_seconds",
+                "max_seconds",
+                "target_seconds",
+                "max_axle_gap",
+            )
+        }
+        exit_ids = list(plan["unidentified_exit_ids"])
+
+        # -- 1. Recompute the identity range from current observations. ----
+        evidence = self._identity_evidence(section_id, exit_ids, rules)
+        current_decisions = {
+            decision["exit_event_id"]: decision
+            for decision in evidence["decisions"]
+        }
+        for pair in forced_pairs:
+            decision = current_decisions.get(pair["exit_event_id"])
+            if decision is None:
+                raise ValueError("forced exit is no longer a designated exit")
+            if (
+                decision["status"] != "forced"
+                or decision["may_be_unmatched"]
+                or decision["possible_entry_ids"] != [pair["entry_event_id"]]
+            ):
+                raise ValueError(
+                    "a forced association is no longer forced under current evidence"
+                )
+
+        # -- 2. The original forced observations must be byte-for-byte the
+        # same evidence, except for UTC-equivalent timestamp spelling. -------
+        current_by_id = {
+            event["id"]: event for event in self._section_events(section_id)
+        }
+        plan_entries = {
+            event["id"]: event for event in plan["entry_candidates"]
+        }
+        plan_exits = {event["id"]: event for event in plan["exits"]}
+        for pair in forced_pairs:
+            entry_id = pair["entry_event_id"]
+            exit_id = pair["exit_event_id"]
+            original_entry = plan_entries.get(entry_id)
+            original_exit = plan_exits.get(exit_id)
+            if original_entry is None or original_exit is None:
+                raise ValueError("plan evidence is missing a forced observation")
+            current_entry = current_by_id.get(entry_id)
+            current_exit = current_by_id.get(exit_id)
+            if current_entry is None or current_exit is None:
+                raise ValueError("a forced observation disappeared or moved section")
+            if not self._same_observation(current_entry, original_entry):
+                raise ValueError("a forced entry observation changed")
+            if not self._same_observation(current_exit, original_exit):
+                raise ValueError("a forced exit observation changed")
+            if current_entry["checkpoint"] != section["entry"]:
+                raise ValueError("a forced entry moved off the section entry")
+            if current_exit["checkpoint"] != section["exit"]:
+                raise ValueError("a forced exit moved off the section exit")
+
+        # -- 3. Staged verification with the old real pairing semantics. ----
+        section_events = self._section_events(section_id)
+        designated = set(exit_ids)
+        baseline = pair_events(
+            [event for event in section_events if event["id"] not in designated],
+            section["entry"],
+            section["exit"],
+        )
+
+        new_train_by_exit: dict[str, str] = {}
+        for pair in forced_pairs:
+            new_train_by_exit[pair["exit_event_id"]] = pair["train_id"]
+        staged_events = [
+            dict(event, train_id=new_train_by_exit[event["id"]])
+            if event["id"] in new_train_by_exit
+            else dict(event)
+            for event in section_events
+        ]
+        staged = pair_events(staged_events, section["entry"], section["exit"])
+        staged_pairs = {
+            (movement["entry_event_id"], movement["exit_event_id"])
+            for movement in staged["movements"]
+        }
+        for pair in forced_pairs:
+            if (pair["entry_event_id"], pair["exit_event_id"]) not in staged_pairs:
+                raise ValueError(
+                    "a forced pair would not produce the promised movement"
+                )
+        for movement in baseline["movements"]:
+            if (
+                movement["entry_event_id"],
+                movement["exit_event_id"],
+            ) not in staged_pairs:
+                raise ValueError(
+                    "back-fill would destroy an existing normal movement"
+                )
+
+        # -- 4. Commit one ordinary source revision with all corrections. ---
+        events = self._state["events"]
+        applied_pairs: list[dict[str, Any]] = []
+        changed = False
+        earliest_day: str | None = None
+        for pair in sorted(forced_pairs, key=lambda item: item["exit_event_id"]):
+            exit_id = pair["exit_event_id"]
+            old_event = events[exit_id]
+            old_train = old_event["train_id"]
+            new_train = pair["train_id"]
+            applied_pairs.append(
+                {
+                    "entry_event_id": pair["entry_event_id"],
+                    "exit_event_id": exit_id,
+                    "train_id": new_train,
+                    "old_train_id": old_train,
+                    "new_train_id": new_train,
+                }
+            )
+            if old_train == new_train:
+                continue
+            new_event = dict(old_event, train_id=new_train)
+            events[exit_id] = new_event
+            changed = True
+            day = old_event["time"][:10]
+            if earliest_day is None or day < earliest_day:
+                earliest_day = day
+
+        if changed:
+            new_revision = int(self._state["revision"]) + 1
+            assert earliest_day is not None
+            self._invalidate_from(section_id, earliest_day, new_revision)
+            self._state["revision"] = new_revision
+            self._grouped = None
+        else:
+            new_revision = int(self._state["revision"])
+
+        result = {
+            "plan_id": plan_id,
+            "revision": new_revision,
+            "changed": changed,
+            "applied_pairs": applied_pairs,
+        }
+        self._put_request(request_id, identity, result)
+        self._commit(request_id)
+        return copy.deepcopy(result)
+
