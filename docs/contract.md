@@ -6,3 +6,5 @@ An entry opens occupancy for that train and section. The matching exit closes it
 
 The output is a structured event reconciliation for post-run data quality, not a dashboard, ticketing system or physical simulator. Future reset-authorisation records can attach to section and event identities without rewriting the observed movement evidence.
 
+The persistent UTC-day handoff archive extends this baseline with immutable package bodies, parent-day lineage, source-revision withdrawal, take receipts and idempotent request replay. Its detailed contract and recovery semantics are in [reconciliation-archive.md](reconciliation-archive.md). Like the baseline, it is offline data-version handoff only and is not signalling control or section-safety certification.
+
